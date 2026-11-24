@@ -1,0 +1,208 @@
+CONTEXTO DEL TALLER: CONSISTENCIA Y PATRONES DE DISEÑO
+Proyecto: Hotel Booking
+Estudiante: Michael Alejandro Casas Castaño
+Base de datos asignada: Hotel Booking
+
+1. PROPÓSITO DEL TALLER
+El proyecto demuestra, mediante una aplicación pequeña de reservas hoteleras, el uso de PostgreSQL y los contenidos indicados en INSTRUCCIONES.txt: propiedades ACID, transacciones, consistencia, concurrencia, control de fallos, principios SOLID y patrones Proxy, Observer, Adapter y Circuit Breaker.
+
+El flujo principal de negocio es seleccionar un huésped y una habitación, comprobar su disponibilidad, crear la reserva, solicitar el pago a un proveedor externo simulado, registrar el pago y confirmar la reserva dentro de una transacción PostgreSQL.
+
+2. TECNOLOGÍAS Y HERRAMIENTAS
+- Python 3.12 como lenguaje de la aplicación.
+- Flask 3.1.0 para la interfaz web y la API HTTP/JSON.
+- PostgreSQL 16 como motor de base de datos relacional.
+- Psycopg 3.2.3 para conexiones y consultas PostgreSQL desde Python.
+- Requests 2.32.3 para invocar el servicio externo HTTP.
+- Docker y Docker Compose para ejecutar la aplicación, PostgreSQL y el proveedor simulado en contenedores.
+- unittest para pruebas unitarias de Proxy, Observer y Circuit Breaker.
+- ThreadPoolExecutor y Requests en el script de demostración de concurrencia.
+
+Dependencias declaradas en requirements.txt:
+    Flask==3.1.0
+    psycopg[binary]==3.2.3
+    requests==2.32.3
+
+3. ESTRUCTURA DEL PROYECTO
+    app/
+      main.py             Aplicación Flask, formularios web y rutas HTTP/API.
+      service.py          Caso de uso de reserva e inicialización de componentes.
+      repository.py       Consultas SQL y transacción de reserva/pago.
+      contracts.py        Contratos abstractos para repositorio, gateway y observador.
+      payment.py          Gateway, proveedor externo, Adapter y Proxy.
+      observers.py        Bus de eventos y observadores de auditoría/notificación.
+      circuit_breaker.py  Estados CLOSED, OPEN y HALF_OPEN.
+      config.py           Configuración desde variables de entorno.
+    database/
+      schema.sql          Esquema, restricciones, índices y datos iniciales.
+      BD_CasasMichael.sql Respaldo lógico SQL para reconstruir tablas y datos iniciales.
+    external_service/
+      server.py           Servicio de pagos HTTP simulado.
+      Dockerfile          Imagen del servicio externo.
+    scripts/
+      concurrency_demo.py Dos solicitudes simultáneas para demostrar el control de solapamiento.
+    tests/
+      test_patterns.py    Pruebas unitarias de patrones.
+    docs/
+      API.md              Rutas y ejemplos de uso.
+      INFORME_GUIA.md     Guía de evidencias para el informe académico.
+    Dockerfile            Imagen de la aplicación Flask.
+    docker-compose.yml   Servicios app, db y external-service.
+    requirements.txt     Dependencias Python.
+    README.md             Instalación, ejecución, pruebas y restauración.
+    INSTRUCCIONES.txt     Consigna académica.
+
+4. ARQUITECTURA Y DATOS
+La aplicación se organiza en capas sencillas: presentación HTTP en app/main.py, caso de uso en app/service.py, persistencia en app/repository.py, contratos en app/contracts.py e integración de pagos/patrones en app/payment.py y app/observers.py. PostgreSQL y el proveedor de pagos se ejecutan como servicios distintos en Docker Compose.
+
+Tablas principales del esquema:
+- guests: huéspedes; nombre y correo obligatorios, correo único.
+- rooms: habitaciones, tipo, tarifa y estado.
+- bookings: reserva con referencias a huésped y habitación, fechas, total y estado.
+- payments: pago asociado a una reserva, monto, método, estado y referencia externa.
+
+El esquema define claves primarias y foráneas, restricciones CHECK para fechas, tarifas, montos y estados permitidos, y varios índices. El archivo database/schema.sql representa un esquema funcional para el taller. Según README.md, no se incluyó en el material revisado el DDL oficial original de la base asignada; por ello, si existe uno entregado por el docente, debe compararse con este esquema.
+
+5. RUTAS Y OPERACIÓN PRINCIPAL
+- GET /: interfaz web para consultar datos y registrar huéspedes, habitaciones y reservas.
+- GET /api/health: estado de salud.
+- GET /api/data: consulta huéspedes, habitaciones, reservas y pagos.
+- POST /api/guests: alta de huésped.
+- POST /api/rooms: alta de habitación.
+- POST /api/bookings: reserva y pago transaccional; simulate_error=true provoca rollback.
+- POST /api/bookings/<id>/cancel: cancelación lógica de reserva.
+
+La reserva bloquea la fila de habitación con SELECT ... FOR UPDATE, valida habitación y huésped, comprueba fechas solapadas y calcula el total. Luego crea la reserva, procesa el pago, guarda el pago y confirma la reserva. La conexión usa un bloque transaccional psycopg; si se lanza una excepción, el contexto revierte la transacción.
+
+Fragmento representativo — app/repository.py:
+    with self.connect() as c:
+        with c.transaction():
+            room = c.execute(
+                "SELECT * FROM rooms WHERE id=%s FOR UPDATE",
+                (data["room_id"],)
+            ).fetchone()
+            if not room:
+                raise ValueError("Habitación inexistente")
+
+            # Se verifica el solapamiento antes de insertar.
+            conflict = c.execute("""SELECT id FROM bookings
+                WHERE room_id=%s AND status IN ('PENDING','CONFIRMED')
+                AND check_in < %s AND check_out > %s LIMIT 1""",
+                (data["room_id"], data["check_out"], data["check_in"])
+            ).fetchone()
+            if conflict:
+                raise ValueError("La habitación ya está reservada en esas fechas")
+
+            # Se insertan booking y payment, y se confirma la reserva.
+            # Una excepción antes del fin del bloque causa rollback.
+
+6. ACID, CONSISTENCIA Y CONCURRENCIA
+- Atomicidad: la opción simulate_error genera una excepción después de insertar la reserva y antes de terminar el proceso; el bloque transaccional revierte los cambios.
+- Consistencia: restricciones SQL y validaciones de negocio impiden fechas inválidas, montos no permitidos, referencias inexistentes y reservas solapadas detectadas por la aplicación.
+- Aislamiento/concurrencia: SELECT FOR UPDATE serializa solicitudes que bloquean la misma fila de habitación; la segunda solicitud vuelve a consultar las reservas y rechaza el solapamiento.
+- Durabilidad: PostgreSQL usa el volumen persistente hotel_pgdata en Docker Compose. Tras confirmar una reserva, reiniciar la aplicación no debe borrar los datos.
+
+Fragmento representativo — database/schema.sql:
+    CREATE TABLE bookings (
+      id BIGSERIAL PRIMARY KEY,
+      guest_id BIGINT NOT NULL REFERENCES guests(id),
+      room_id BIGINT NOT NULL REFERENCES rooms(id),
+      check_in DATE NOT NULL,
+      check_out DATE NOT NULL,
+      total_amount NUMERIC(12,2) NOT NULL CHECK(total_amount>=0),
+      status VARCHAR(20) NOT NULL
+        CHECK(status IN ('PENDING','CONFIRMED','CANCELLED')),
+      CHECK(check_out>check_in)
+    );
+
+7. PRINCIPIOS SOLID EN EL PROYECTO
+- S — Responsabilidad única: main.py gestiona HTTP, service.py coordina el caso de uso, repository.py persiste datos y observers.py reacciona a eventos.
+- O — Abierto/cerrado: PaymentGateway permite integrar implementaciones de pago compatibles; se pueden añadir gateways sin cambiar el flujo principal.
+- L — Sustitución de Liskov: FakePaymentGateway y HttpPaymentAdapter implementan el contrato PaymentGateway y pueden sustituirse en el consumidor.
+- I — Segregación de interfaces: contratos pequeños BookingRepository, PaymentGateway y BookingObserver separan capacidades.
+- D — Inversión de dependencias: BookingService recibe repositorio, gateway y bus de eventos como dependencias.
+
+Fragmento representativo — app/contracts.py:
+    class PaymentGateway(ABC):
+        @abstractmethod
+        def pay(self, amount, booking_id):
+            ...
+
+8. PATRONES DE DISEÑO
+Proxy — app/payment.py
+PaymentProxy valida que el monto sea positivo, registra la operación y delega el pago al gateway real.
+    class PaymentProxy(PaymentGateway):
+        def __init__(self, real_gateway):
+            self.real_gateway = real_gateway
+
+        def pay(self, amount, booking_id):
+            if amount <= 0:
+                raise ValueError("El pago debe ser mayor que cero")
+            print(f"[PaymentProxy] Audita pago reserva {booking_id}: {amount}")
+            return self.real_gateway.pay(amount, booking_id)
+
+Adapter — app/payment.py y external_service/server.py
+La aplicación utiliza el contrato pay(amount, booking_id). El proveedor simulado ofrece executeTransaction(value, code). HttpPaymentAdapter adapta la llamada sin cambiar el servicio de reservas.
+    def pay(self, amount, booking_id):
+        return self.breaker.call(
+            lambda: self.provider.executeTransaction(
+                float(amount), str(booking_id)
+            )
+        )
+
+Observer — app/observers.py
+EventBus distribuye BOOKING_CONFIRMED a AuditObserver y NotificationObserver.
+    bus = EventBus()
+    bus.subscribe(AuditObserver())
+    bus.subscribe(NotificationObserver())
+    bus.publish("BOOKING_CONFIRMED", event)
+
+Circuit Breaker — app/circuit_breaker.py
+Después de tres fallos consecutivos pasa de CLOSED a OPEN. Transcurridos 10 segundos, una llamada puede probar el servicio en HALF_OPEN; éxito cierra el circuito y fallo lo vuelve a abrir.
+    if self.state == self.OPEN:
+        if time.monotonic() - self.opened_at >= self.recovery:
+            self.state = self.HALF_OPEN
+        else:
+            raise CircuitOpenError("Circuit Breaker OPEN")
+
+    try:
+        result = operation()
+    except Exception:
+        # Acumula fallos y vuelve a OPEN cuando corresponde.
+        raise
+    else:
+        # Una llamada de prueba exitosa desde HALF_OPEN cierra el circuito.
+        return result
+
+9. EJECUCIÓN Y DEMOSTRACIONES
+Requisitos: Docker Desktop y Docker Compose. Inicio:
+    docker compose up --build
+
+Aplicación: http://localhost:5000
+Proveedor simulado: http://localhost:5001/health
+Conexión a PostgreSQL desde el equipo anfitrión: 127.0.0.1, puerto 5433; dentro de Compose la aplicación utiliza db:5432.
+
+Demostraciones descritas en README.md:
+- Operación normal: crear una reserva desde la interfaz o POST /api/bookings.
+- Rollback: incluir "simulate_error": true en el JSON de POST /api/bookings.
+- Concurrencia: con la aplicación activa ejecutar python scripts/concurrency_demo.py; el resultado esperado es una respuesta 201 y otra 409.
+- Circuit Breaker: detener el servicio con docker compose stop external-service, intentar pagos hasta alcanzar OPEN; iniciarlo con docker compose start external-service, esperar la ventana de recuperación y volver a intentar.
+- Durabilidad: crear reserva, ejecutar docker compose restart app y consultar GET /api/data.
+- Pruebas unitarias: python -m unittest discover -s tests.
+
+10. VERIFICACIONES OBSERVADAS DURANTE LA PREPARACIÓN DEL INFORME
+En las ejecuciones realizadas se observó: GET /api/health respondió status ok; una reserva normal devolvió HTTP 201 y CONFIRMED; el error simulado devolvió HTTP 409; la demostración concurrente produjo una respuesta exitosa y otra de conflicto; con el proveedor detenido el circuito rechazó llamadas y llegó a OPEN; tras recuperar el proveedor hubo una llamada exitosa; los datos persistieron al reiniciar la aplicación; y las tres pruebas unitarias existentes finalizaron correctamente.
+
+11. ALCANCE Y PUNTOS PENDIENTES DE LA ENTREGA
+Este contexto describe lo que el código y las ejecuciones revisadas respaldan. La consigna del taller solicita CRUD con edición; la interfaz y API revisadas permiten alta, consulta y cancelación lógica, pero no se encontró una función de edición. README.md indica que el respaldo custom .backup debe generarse con pg_dump desde PostgreSQL en ejecución; en los archivos enumerados no se encuentra dicho archivo. La consigna también pide entregar un PDF con capturas reales, URL del repositorio y un ZIP del proyecto con el backup; estos artefactos no están incluidos en esta carpeta según la revisión realizada. El password local de demostración aparece en docker-compose.yml y app/config.py; debe mantenerse como credencial local no reutilizable y no sustituirse por secretos reales en el repositorio.
+
+12. ARCHIVOS DE REFERENCIA
+- INSTRUCCIONES.txt: consigna completa del taller y requisitos de entrega.
+- README.md: guía de instalación, ejecución, pruebas y restauración.
+- docs/API.md: endpoints.
+- docs/INFORME_GUIA.md: estructura sugerida para el informe.
+- database/schema.sql: esquema PostgreSQL activo.
+- database/BD_CasasMichael.sql: respaldo lógico SQL reproducible.
+- docker-compose.yml: configuración de servicios y persistencia.
+
+Este archivo es un resumen contextual del taller y del código relevante; no sustituye el README ni el informe académico requerido.
